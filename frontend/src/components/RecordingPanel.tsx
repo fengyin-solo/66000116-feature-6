@@ -1,6 +1,15 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { useEEGStore } from '../store/eeg';
 import { Recording } from '../types';
+import { AnnotationPanel } from './AnnotationPanel';
+import { HistoryFilterBar } from './HistoryFilterBar';
+import {
+  ANNOTATION_LABELS,
+  formatClock,
+  getLabelColor,
+  getLabelName,
+  recordingMatchesFilters,
+} from '../utils/annotations';
 
 const CHANNEL_NAMES: Record<string, string> = {
   Fp1: '左前额', Fp2: '右前额', F3: '左额', F4: '右额',
@@ -28,23 +37,30 @@ export const RecordingPanel: React.FC = () => {
     isRecording,
     currentRecordingFrames,
     recordings,
+    historyFilters,
+    saveError,
+    pendingRecording,
     playbackMode,
     activeRecording,
     playbackState,
     startRecording,
     stopRecording,
+    retrySavePending,
+    cancelPendingRecording,
     deleteRecording,
     enterPlaybackMode,
     exitPlaybackMode,
     setPlaybackTime,
     togglePlayback,
     setPlaybackPlaying,
+    jumpToAnnotation,
     selectedChannel,
   } = useEEGStore();
 
   const [recordingName, setRecordingName] = useState('');
   const [showNameDialog, setShowNameDialog] = useState(false);
   const [elapsedTime, setElapsedTime] = useState(0);
+  const [banner, setBanner] = useState<{ type: 'error' | 'warning'; text: string } | null>(null);
   const timerRef = useRef<number | null>(null);
   const playbackTimerRef = useRef<number | null>(null);
 
@@ -69,10 +85,11 @@ export const RecordingPanel: React.FC = () => {
     if (playbackState.isPlaying && activeRecording) {
       playbackTimerRef.current = window.setInterval(() => {
         const { playbackState, activeRecording, setPlaybackTime, setPlaybackPlaying } = useEEGStore.getState();
-        if (!activeRecording) return;
+        if (!activeRecording || activeRecording.frames.length === 0) return;
+        const lastFrameTime = activeRecording.frames[activeRecording.frames.length - 1].relativeTime;
         const newTime = playbackState.currentTime + 0.1;
-        if (newTime >= activeRecording.duration) {
-          setPlaybackTime(activeRecording.duration);
+        if (newTime >= lastFrameTime) {
+          setPlaybackTime(lastFrameTime);
           setPlaybackPlaying(false);
         } else {
           setPlaybackTime(newTime);
@@ -89,7 +106,13 @@ export const RecordingPanel: React.FC = () => {
     };
   }, [playbackState.isPlaying, activeRecording]);
 
+  const filteredRecordings = useMemo(
+    () => [...recordings].reverse().filter((r) => recordingMatchesFilters(r, historyFilters)),
+    [recordings, historyFilters],
+  );
+
   const handleStartRecording = () => {
+    setBanner(null);
     startRecording();
   };
 
@@ -98,23 +121,46 @@ export const RecordingPanel: React.FC = () => {
   };
 
   const handleConfirmSave = () => {
-    stopRecording(recordingName.trim());
-    setRecordingName('');
+    const result = stopRecording(recordingName.trim());
     setShowNameDialog(false);
+    setRecordingName('');
+    if (!result.ok) {
+      if (result.reason && !result.reason.includes('尚未保存')) {
+        setBanner({ type: 'warning', text: result.reason });
+      }
+      // 保存失败时 store 保留 pendingRecording 并显示重试条
+    }
   };
 
   const handleCancelSave = () => {
-    useEEGStore.setState({
-      isRecording: false,
-      recordingStartTime: 0,
-      currentRecordingFrames: [],
-    });
+    cancelPendingRecording();
     setShowNameDialog(false);
     setRecordingName('');
   };
 
   const handlePlayRecording = (recording: Recording) => {
-    enterPlaybackMode(recording);
+    setBanner(null);
+    const result = enterPlaybackMode(recording);
+    if (!result.ok) {
+      setBanner({ type: 'error', text: result.reason ?? '无法进入回放' });
+    }
+  };
+
+  const handleDeleteRecording = (id: string) => {
+    const result = deleteRecording(id);
+    if (!result.ok) {
+      setBanner({ type: 'error', text: result.reason ?? '删除失败' });
+    }
+  };
+
+  const handleJumpFromHistory = (recordingId: string, annotationId: string) => {
+    setBanner(null);
+    const result = jumpToAnnotation(recordingId, annotationId);
+    if (!result.ok) {
+      setBanner({ type: 'error', text: result.reason ?? '跳转失败' });
+    } else if (result.warning) {
+      setBanner({ type: 'warning', text: result.warning });
+    }
   };
 
   const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -131,12 +177,79 @@ export const RecordingPanel: React.FC = () => {
     setPlaybackTime(time);
   };
 
+  // 当前回放时刻命中的标注（用于头部提示）
+  const activeAnnotation = activeRecording?.annotations.find(
+    (a) => playbackState.currentTime >= a.start && playbackState.currentTime < a.end,
+  );
+
+  const lastFrameTime = activeRecording && activeRecording.frames.length > 0
+    ? activeRecording.frames[activeRecording.frames.length - 1].relativeTime
+    : 0;
+
   return (
     <div style={{ padding: '16px', background: '#fff', borderRadius: '12px', margin: '16px', boxShadow: '0 2px 8px rgba(0,0,0,0.06)' }}>
       <h3 style={{ margin: '0 0 16px', display: 'flex', alignItems: 'center', gap: '8px' }}>
         <span style={{ fontSize: '20px' }}>⏺</span>
         录制与回放
       </h3>
+
+      {banner && (
+        <div style={{
+          marginBottom: '12px',
+          padding: '8px 10px',
+          fontSize: '11px',
+          lineHeight: 1.5,
+          borderRadius: '6px',
+          background: banner.type === 'error' ? '#ffebee' : '#fff8e1',
+          color: banner.type === 'error' ? '#b71c1c' : '#e65100',
+          border: `1px solid ${banner.type === 'error' ? '#ef9a9a' : '#ffcc80'}`,
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'flex-start',
+          gap: '8px',
+        }}>
+          <span>{banner.type === 'error' ? '⚠ ' : 'ℹ '}{banner.text}</span>
+          <button
+            onClick={() => setBanner(null)}
+            style={{ border: 'none', background: 'transparent', color: 'inherit', cursor: 'pointer', padding: 0, fontSize: '12px' }}
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
+      {saveError && pendingRecording && (
+        <div style={{
+          marginBottom: '12px',
+          padding: '10px',
+          borderRadius: '8px',
+          background: '#fff3e0',
+          border: '1px solid #ffb74d',
+        }}>
+          <div style={{ fontSize: '11px', color: '#e65100', lineHeight: 1.5, marginBottom: '8px' }}>
+            ⚠ {saveError}
+            <br />
+            录制「{pendingRecording.name}」（{pendingRecording.frames.length} 帧）仍保留在内存中，原历史录制未受影响。
+          </div>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <button
+              onClick={() => {
+                const r = retrySavePending();
+                if (r.ok) setBanner(null);
+              }}
+              style={{ padding: '5px 12px', fontSize: '11px', borderRadius: '5px', border: 'none', background: '#e65100', color: '#fff', cursor: 'pointer', fontWeight: 600 }}
+            >
+              重试保存
+            </button>
+            <button
+              onClick={cancelPendingRecording}
+              style={{ padding: '5px 12px', fontSize: '11px', borderRadius: '5px', border: '1px solid #ffb74d', background: '#fff', color: '#e65100', cursor: 'pointer' }}
+            >
+              放弃该录制
+            </button>
+          </div>
+        </div>
+      )}
 
       {!playbackMode && (
         <div style={{ marginBottom: '16px' }}>
@@ -231,6 +344,11 @@ export const RecordingPanel: React.FC = () => {
               </div>
               <div style={{ fontSize: '11px', color: '#666', marginTop: '2px' }}>
                 {CHANNEL_NAMES[activeRecording.channel] || activeRecording.channel} · {formatDuration(activeRecording.duration)}
+                {activeAnnotation && (
+                  <span style={{ marginLeft: '6px', color: getLabelColor(activeAnnotation.label), fontWeight: 600 }}>
+                    · 正在「{getLabelName(activeAnnotation.label)}」片段
+                  </span>
+                )}
               </div>
             </div>
             <button
@@ -250,115 +368,158 @@ export const RecordingPanel: React.FC = () => {
             </button>
           </div>
 
-          <div style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: '12px',
-            marginBottom: '10px',
-          }}>
-            <button
-              onClick={togglePlayback}
-              style={{
-                width: '44px',
-                height: '44px',
-                borderRadius: '50%',
-                background: '#1565c0',
-                color: '#fff',
-                border: 'none',
-                fontSize: '18px',
-                cursor: 'pointer',
+          {activeRecording.frames.length === 0 ? (
+            <div style={{
+              padding: '16px',
+              textAlign: 'center',
+              fontSize: '12px',
+              color: '#b71c1c',
+              background: '#ffebee',
+              borderRadius: '8px',
+              border: '1px solid #ef9a9a',
+            }}>
+              ⚠ 该录制没有任何数据帧，波形 / 频段 / 脑状态 / 相关结果无法回放；仍可在下方管理标注。
+            </div>
+          ) : (
+            <>
+              <div style={{
                 display: 'flex',
                 alignItems: 'center',
-                justifyContent: 'center',
-                flexShrink: 0,
-              }}
-            >
-              {playbackState.isPlaying ? '⏸' : '▶'}
-            </button>
-
-            <div style={{ flex: 1 }}>
-              <div
-                onClick={handleProgressClick}
-                style={{
-                  height: '8px',
-                  background: '#90caf9',
-                  borderRadius: '4px',
-                  cursor: 'pointer',
-                  position: 'relative',
-                  overflow: 'hidden',
-                }}
-              >
-                <div
+                gap: '12px',
+                marginBottom: '10px',
+              }}>
+                <button
+                  onClick={togglePlayback}
                   style={{
-                    height: '100%',
+                    width: '44px',
+                    height: '44px',
+                    borderRadius: '50%',
                     background: '#1565c0',
-                    width: `${(playbackState.currentTime / activeRecording.duration) * 100}%`,
-                    borderRadius: '4px',
-                    transition: 'width 0.1s linear',
+                    color: '#fff',
+                    border: 'none',
+                    fontSize: '18px',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    flexShrink: 0,
                   }}
-                />
-              </div>
-              <input
-                type="range"
-                min="0"
-                max={activeRecording.duration}
-                step="0.1"
-                value={playbackState.currentTime}
-                onChange={handleSeek}
-                style={{
-                  width: '100%',
-                  marginTop: '4px',
-                  opacity: 0,
-                  position: 'absolute',
-                  pointerEvents: 'none',
-                }}
-              />
-            </div>
+                >
+                  {playbackState.isPlaying ? '⏸' : '▶'}
+                </button>
 
-            <span style={{ fontSize: '12px', color: '#666', minWidth: '70px', textAlign: 'right' }}>
-              {formatDuration(playbackState.currentTime)} / {formatDuration(activeRecording.duration)}
-            </span>
-          </div>
+                <div style={{ flex: 1 }}>
+                  <div
+                    onClick={handleProgressClick}
+                    style={{
+                      height: '12px',
+                      background: '#90caf9',
+                      borderRadius: '6px',
+                      cursor: 'pointer',
+                      position: 'relative',
+                      overflow: 'hidden',
+                    }}
+                  >
+                    <div
+                      style={{
+                        height: '100%',
+                        background: '#1565c0',
+                        width: `${(playbackState.currentTime / Math.max(activeRecording.duration, 0.001)) * 100}%`,
+                        borderRadius: '6px',
+                        transition: 'width 0.1s linear',
+                      }}
+                    />
+                    {/* 标注片段标记 */}
+                    {activeRecording.annotations.map((a) => (
+                      <div
+                        key={a.id}
+                        title={`${getLabelName(a.label)} ${formatClock(a.start, true)}–${formatClock(a.end, true)}（点击跳转）`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          const r = jumpToAnnotation(activeRecording.id, a.id);
+                          if (!r.ok) setBanner({ type: 'error', text: r.reason ?? '跳转失败' });
+                          else if (r.warning) setBanner({ type: 'warning', text: r.warning });
+                        }}
+                        style={{
+                          position: 'absolute',
+                          top: 0,
+                          bottom: 0,
+                          left: `${(a.start / Math.max(activeRecording.duration, 0.001)) * 100}%`,
+                          width: `${Math.max(2, ((a.end - a.start) / Math.max(activeRecording.duration, 0.001)) * 100)}%`,
+                          background: getLabelColor(a.label),
+                          opacity: playbackState.currentTime >= a.start && playbackState.currentTime < a.end ? 0.95 : 0.55,
+                          borderLeft: '1px solid rgba(255,255,255,0.9)',
+                          borderRight: '1px solid rgba(255,255,255,0.9)',
+                          cursor: 'pointer',
+                        }}
+                      />
+                    ))}
+                  </div>
+                  <input
+                    type="range"
+                    min="0"
+                    max={activeRecording.duration}
+                    step="0.1"
+                    value={playbackState.currentTime}
+                    onChange={handleSeek}
+                    style={{
+                      width: '100%',
+                      marginTop: '4px',
+                      opacity: 0,
+                      position: 'absolute',
+                      pointerEvents: 'none',
+                    }}
+                  />
+                </div>
 
-          {playbackState.currentFrame && (
-            <div>
-              <div style={{
-                display: 'flex',
-                gap: '8px',
-                flexWrap: 'wrap',
-                padding: '8px',
-                background: 'rgba(255,255,255,0.5)',
-                borderRadius: '6px',
-                marginBottom: '6px',
-              }}>
-                <span style={{ fontSize: '11px', color: '#1976d2' }}>专注: {playbackState.currentFrame.brainState.focus.toFixed(0)}</span>
-                <span style={{ fontSize: '11px', color: '#388e3c' }}>放松: {playbackState.currentFrame.brainState.relaxation.toFixed(0)}</span>
-                <span style={{ fontSize: '11px', color: '#d32f2f' }}>疲劳: {playbackState.currentFrame.brainState.fatigue.toFixed(0)}</span>
-                <span style={{ fontSize: '11px', color: '#666' }}>|</span>
-                <span style={{ fontSize: '11px', color: '#1565c0' }}>α: {playbackState.currentFrame.bands.alpha.toFixed(2)}</span>
-                <span style={{ fontSize: '11px', color: '#e53935' }}>β: {playbackState.currentFrame.bands.beta.toFixed(2)}</span>
-                <span style={{ fontSize: '11px', color: '#2e7d32' }}>θ: {playbackState.currentFrame.bands.theta.toFixed(2)}</span>
+                <span style={{ fontSize: '12px', color: '#666', minWidth: '96px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
+                  {formatClock(playbackState.currentTime, true)} / {formatClock(lastFrameTime, true)}
+                </span>
               </div>
-              <div style={{
-                display: 'flex',
-                gap: '8px',
-                flexWrap: 'wrap',
-                padding: '8px',
-                background: 'rgba(255,255,255,0.5)',
-                borderRadius: '6px',
-              }}>
-                <span style={{ fontSize: '11px', color: '#666', fontWeight: 500 }}>相关度:</span>
-                {playbackState.currentFrame?.correlation.correlations
-                  .filter(c => c.channel !== playbackState.currentFrame?.correlation.targetChannel)
-                  .slice(0, 3)
-                  .map((c, i) => (
-                    <span key={i} style={{ fontSize: '11px', color: '#6a1b9a' }}>
-                      {c.channel}: {(Math.abs(c.correlation) * 100).toFixed(0)}%
-                    </span>
-                  ))}
-              </div>
-            </div>
+
+              {playbackState.currentFrame && (
+                <div>
+                  <div style={{
+                    display: 'flex',
+                    gap: '8px',
+                    flexWrap: 'wrap',
+                    padding: '8px',
+                    background: 'rgba(255,255,255,0.5)',
+                    borderRadius: '6px',
+                    marginBottom: '6px',
+                  }}>
+                    <span style={{ fontSize: '11px', color: '#1976d2' }}>专注: {playbackState.currentFrame.brainState.focus.toFixed(0)}</span>
+                    <span style={{ fontSize: '11px', color: '#388e3c' }}>放松: {playbackState.currentFrame.brainState.relaxation.toFixed(0)}</span>
+                    <span style={{ fontSize: '11px', color: '#d32f2f' }}>疲劳: {playbackState.currentFrame.brainState.fatigue.toFixed(0)}</span>
+                    <span style={{ fontSize: '11px', color: '#666' }}>|</span>
+                    <span style={{ fontSize: '11px', color: '#1565c0' }}>α: {playbackState.currentFrame.bands.alpha.toFixed(2)}</span>
+                    <span style={{ fontSize: '11px', color: '#e53935' }}>β: {playbackState.currentFrame.bands.beta.toFixed(2)}</span>
+                    <span style={{ fontSize: '11px', color: '#2e7d32' }}>θ: {playbackState.currentFrame.bands.theta.toFixed(2)}</span>
+                  </div>
+                  <div style={{
+                    display: 'flex',
+                    gap: '8px',
+                    flexWrap: 'wrap',
+                    padding: '8px',
+                    background: 'rgba(255,255,255,0.5)',
+                    borderRadius: '6px',
+                  }}>
+                    <span style={{ fontSize: '11px', color: '#666', fontWeight: 500 }}>相关度:</span>
+                    {playbackState.currentFrame?.correlation.correlations
+                      .filter(c => c.channel !== playbackState.currentFrame?.correlation.targetChannel)
+                      .slice(0, 3)
+                      .map((c, i) => (
+                        <span key={i} style={{ fontSize: '11px', color: '#6a1b9a' }}>
+                          {c.channel}: {(Math.abs(c.correlation) * 100).toFixed(0)}%
+                        </span>
+                      ))}
+                  </div>
+                </div>
+              )}
+            </>
           )}
+
+          <AnnotationPanel recording={activeRecording} currentTime={playbackState.currentTime} />
         </div>
       )}
 
@@ -371,6 +532,9 @@ export const RecordingPanel: React.FC = () => {
         }}>
           历史录制 ({recordings.length})
         </div>
+
+        <HistoryFilterBar total={recordings.length} shown={filteredRecordings.length} />
+
         {recordings.length === 0 ? (
           <div style={{
             padding: '24px',
@@ -382,9 +546,20 @@ export const RecordingPanel: React.FC = () => {
           }}>
             暂无录制记录
           </div>
+        ) : filteredRecordings.length === 0 ? (
+          <div style={{
+            padding: '20px',
+            textAlign: 'center',
+            color: '#90a4ae',
+            fontSize: '12px',
+            border: '1px dashed #b0bec5',
+            borderRadius: '8px',
+          }}>
+            没有符合当前筛选条件的录制
+          </div>
         ) : (
-          <div style={{ maxHeight: '280px', overflow: 'auto' }}>
-            {[...recordings].reverse().map((recording) => (
+          <div style={{ maxHeight: '320px', overflow: 'auto' }}>
+            {filteredRecordings.map((recording) => (
               <div
                 key={recording.id}
                 style={{
@@ -411,8 +586,19 @@ export const RecordingPanel: React.FC = () => {
                       whiteSpace: 'nowrap',
                       overflow: 'hidden',
                       textOverflow: 'ellipsis',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '6px',
                     }}>
-                      {recording.name}
+                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{recording.name}</span>
+                      {recording.frames.length === 0 && (
+                        <span title="该录制没有数据帧，无法回放" style={{
+                          flexShrink: 0, fontSize: '10px', padding: '1px 6px', borderRadius: '8px',
+                          background: '#ffebee', color: '#b71c1c', border: '1px solid #ef9a9a',
+                        }}>
+                          无帧
+                        </span>
+                      )}
                     </div>
                     <div style={{ fontSize: '11px', color: '#999', marginTop: '2px' }}>
                       {formatTime(recording.startTime)} · {CHANNEL_NAMES[recording.channel] || recording.channel}
@@ -421,6 +607,8 @@ export const RecordingPanel: React.FC = () => {
                   <div style={{ display: 'flex', gap: '4px', flexShrink: 0 }}>
                     <button
                       onClick={() => handlePlayRecording(recording)}
+                      disabled={recording.frames.length === 0}
+                      title={recording.frames.length === 0 ? '该录制没有数据帧，无法回放' : ''}
                       style={{
                         padding: '4px 10px',
                         background: activeRecording?.id === recording.id ? '#1565c0' : '#f5f5f5',
@@ -429,13 +617,14 @@ export const RecordingPanel: React.FC = () => {
                         borderRadius: '4px',
                         fontSize: '11px',
                         fontWeight: 500,
-                        cursor: 'pointer',
+                        cursor: recording.frames.length === 0 ? 'not-allowed' : 'pointer',
+                        opacity: recording.frames.length === 0 ? 0.55 : 1,
                       }}
                     >
                       {activeRecording?.id === recording.id ? '回放中' : '▶ 回放'}
                     </button>
                     <button
-                      onClick={() => deleteRecording(recording.id)}
+                      onClick={() => handleDeleteRecording(recording.id)}
                       style={{
                         padding: '4px 8px',
                         background: '#ffebee',
@@ -454,13 +643,42 @@ export const RecordingPanel: React.FC = () => {
                   display: 'flex',
                   justifyContent: 'space-between',
                   alignItems: 'center',
+                  gap: '8px',
                 }}>
-                  <span style={{ fontSize: '11px', color: '#666' }}>
-                    时长: {formatDuration(recording.duration)} · {recording.frames.length} 帧
+                  <span style={{ fontSize: '11px', color: '#666', flexShrink: 0 }}>
+                    {formatDuration(recording.duration)} · {recording.frames.length} 帧
                   </span>
-                  <span style={{ fontSize: '11px', color: '#999' }}>
-                    {recording.channel}
-                  </span>
+                  {recording.annotations.length > 0 ? (
+                    <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap', justifyContent: 'flex-end', minWidth: 0 }}>
+                      {recording.annotations.slice(0, 4).map((a) => (
+                        <button
+                          key={a.id}
+                          onClick={() => handleJumpFromHistory(recording.id, a.id)}
+                          disabled={recording.frames.length === 0}
+                          title={`${getLabelName(a.label)} ${formatClock(a.start, true)}–${formatClock(a.end, true)}${a.note ? ' · ' + a.note : ''}（点击跳转）`}
+                          style={{
+                            padding: '1px 7px',
+                            fontSize: '10px',
+                            borderRadius: '9px',
+                            border: `1px solid ${getLabelColor(a.label)}`,
+                            background: `${getLabelColor(a.label)}14`,
+                            color: getLabelColor(a.label),
+                            cursor: recording.frames.length === 0 ? 'not-allowed' : 'pointer',
+                            whiteSpace: 'nowrap',
+                          }}
+                        >
+                          {getLabelName(a.label)} {formatClock(a.start)}
+                        </button>
+                      ))}
+                      {recording.annotations.length > 4 && (
+                        <span style={{ fontSize: '10px', color: '#90a4ae', padding: '1px 4px' }}>
+                          +{recording.annotations.length - 4}
+                        </span>
+                      )}
+                    </div>
+                  ) : (
+                    <span style={{ fontSize: '11px', color: '#999' }}>{recording.channel}</span>
+                  )}
                 </div>
               </div>
             ))}

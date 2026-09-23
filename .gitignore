@@ -4,3 +4,6 @@ __pycache__/
 *.pyc
 .env
 backend/.venv/
+
+# 本地逻辑测试的 tsc 产物
+.testbuild/
